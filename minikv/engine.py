@@ -1,6 +1,7 @@
 from typing import Optional
 from .config import MiniKVConfig, WriteMode
 from .wal import WAL
+from .sst import SSTFile
 import os
 
 
@@ -18,7 +19,7 @@ class MiniKV:
         self.config = config
         self.memtable = {}
         self.sst_files = []  # 未来可以用来存路径或元数据
-        self.wal : Optional[WAL] = None  # 未来会变成 WAL 对象
+        self.wal: Optional[WAL] = None  # 未来会变成 WAL 对象
         self._is_open = False
 
     def open(self) -> None:
@@ -76,6 +77,7 @@ class MiniKV:
 
         # 3. 再更新内存
         self.memtable[key] = value
+        self._maybe_flush_memtable()
 
     def get(self, key: str) -> Optional[str]:
         """
@@ -88,8 +90,16 @@ class MiniKV:
         - 再从memtable里查，如果存在，返回对应的字符串；如果不存在，返回None
         """
         self._ensure_open()
+        # 1. 先查 MemTable
+        if key in self.memtable:
+            return self.memtable.get(key)
+        # 2. 再按“新到旧”的顺序查SST
+        for sst in reversed(self.sst_files):
+            value = sst.search(key)
+            if value is not None:
+                return value
 
-        return self.memtable.get(key)
+        return None
 
     def delete(self, key: str) -> None:
         """
@@ -105,6 +115,7 @@ class MiniKV:
         self.wal.sync()
         # 再从 memtable 中删除（存在才删）
         self.memtable.pop(key, None)
+        self._maybe_flush_memtable()
 
     def _append_wal(self, op_type: str, key: str, value: Optional[str]) -> None:
         """向 WAL 追加一条记录，具体格式后面再定。"""
@@ -112,11 +123,23 @@ class MiniKV:
 
     def _maybe_flush_memtable(self) -> None:
         """在每次写后检查是否需要 flush MemTable"""
-        raise NotImplementedError
+        if len(self.memtable) >= self.config.memtable_limit:
+            self._flush_to_sst()
 
     def _flush_to_sst(self) -> None:
         """把当前 MemTable 刷成一个新的 SST 文件"""
-        raise NotImplementedError
+        # 1. 构造文件路径，例如 data_dir / sst_0001.txt
+        # 2. 调用 SSTFile.write_from_memtable(...)
+        # 3. 把返回的 SSTFile 对象 append 到 self.sst_files
+        # 4. 清空 memtable
+        if not self.memtable:
+            return
+        path = self._next_sst_path()
+        sst = SSTFile.write_from_memtable(path=path, memtable=self.memtable)
+        self.sst_files.append(sst)
+
+        # 刷盘后， 清空 Memtable
+        self.memtable = {}
 
     def _replay_wal(self) -> None:
         """启动时 replay WAL, 重建 MemTable """
@@ -136,4 +159,13 @@ class MiniKV:
     def _build_wal_path(self) -> str:
         # 确保 data_dir 存在
         os.makedirs(self.config.data_dir, exist_ok=True)
-        return os.path.join(self.config.data_dir,"wal.log")
+        return os.path.join(self.config.data_dir, "wal.log")
+
+    def _next_sst_path(self) -> str:
+        """
+        根据当前已有 SST 文件数量生成新文件名。
+        """
+        os.makedirs(self.config.data_dir, exist_ok=True)
+        index = len(self.sst_files)
+        filename = f"sst_{index:04d}.txt"
+        return os.path.join(self.config.data_dir, filename)
