@@ -1,5 +1,7 @@
 from typing import Optional
 from .config import MiniKVConfig, WriteMode
+from .wal import WAL
+import os
 
 
 class MiniKV:
@@ -16,7 +18,7 @@ class MiniKV:
         self.config = config
         self.memtable = {}
         self.sst_files = []  # 未来可以用来存路径或元数据
-        self.wal = None  # 未来会变成 WAL 对象
+        self.wal : Optional[WAL] = None  # 未来会变成 WAL 对象
         self._is_open = False
 
     def open(self) -> None:
@@ -24,19 +26,24 @@ class MiniKV:
         打开引擎：
         - 创建数据目录（如不存在）
         - 打开或创建 WAL
-        - 加载已有 SST 文件元数据
+        - 加载已有 SST 文件元数据 (暂时没有)
         - replay WAL，重建 MemTable
-
-        Milestone 1: 以内存方式打开 KV 引擎
-        - 如果已经打开，直接返回
-        - 标记为打开状态
-        - 使用一个干净的memtable （每次open清空memtable）
         """
         if self._is_open:
             return
 
+        # 1. 标记为open
         self._is_open = True
-        self.memtable = {} # 清空 memtable
+        # 2、 初始化 memtable
+        self.memtable = {}  # 清空 memtable
+
+        # 3. 创建 WAL 实例，并打开文件
+        wal_path = self._build_wal_path()
+        self.wal = WAL(wal_path)
+        self.wal.open()
+
+        # 4. 从 WAL replay 到 memtable
+        self._replay_wal()
 
     def close(self) -> None:
         """ 关闭引擎：
@@ -45,6 +52,12 @@ class MiniKV:
         Milestone 1 ： 以内存方式关闭 KV 引擎
         - 只修改状态，不做flush、也没有 WAL
         """
+        if not self._is_open:
+            return
+        # 未来：这里可以做一次 flush + wal.sync()
+        self._ensure_wal_initialized()
+        self.wal.close()
+        self.wal = None
         self._is_open = False
 
     def put(self, key: str, value: str) -> None:
@@ -52,12 +65,16 @@ class MiniKV:
         写入一个 key-value:
         - 写 WAL (根据 write_mode 决定是否/何时 fsync)
         - 更新 MemTable
-        Milestone 1:
-        - 把key对应的value写入memtable
-        - 如果key已经存在，就覆盖旧值
         """
         self._ensure_open()
+        # 1. 先写 WAL
+        self._ensure_wal_initialized()
+        self.wal.append_put(key, value)
 
+        # 2. 暂时立刻sync一下，后面再换成策略
+        self.wal.sync()
+
+        # 3. 再更新内存
         self.memtable[key] = value
 
     def get(self, key: str) -> Optional[str]:
@@ -82,9 +99,14 @@ class MiniKV:
         """
         self._ensure_open()
 
-        self.memtable.pop(key,None)
+        self._ensure_wal_initialized()
+        self.wal.append_delete(key)
 
-    def _append_wal(self, op_type:str, key:str,value:Optional[str]) -> None:
+        self.wal.sync()
+        # 再从 memtable 中删除（存在才删）
+        self.memtable.pop(key, None)
+
+    def _append_wal(self, op_type: str, key: str, value: Optional[str]) -> None:
         """向 WAL 追加一条记录，具体格式后面再定。"""
         raise NotImplementedError
 
@@ -98,8 +120,20 @@ class MiniKV:
 
     def _replay_wal(self) -> None:
         """启动时 replay WAL, 重建 MemTable """
-        raise NotImplementedError
+        if self.wal is None:
+            return
+        # 将 wal 中记录的操作按顺序应用到 memtable
+        self.wal.replay_into(self.memtable)
 
     def _ensure_open(self) -> None:
         if not self._is_open:
             raise RuntimeError("MiniKV is not open")
+
+    def _ensure_wal_initialized(self) -> None:
+        if self.wal is None:
+            raise RuntimeError("WAL is not initialized")
+
+    def _build_wal_path(self) -> str:
+        # 确保 data_dir 存在
+        os.makedirs(self.config.data_dir, exist_ok=True)
+        return os.path.join(self.config.data_dir,"wal.log")
