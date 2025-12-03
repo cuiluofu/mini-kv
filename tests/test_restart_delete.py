@@ -143,6 +143,10 @@ def phase2_second_run() -> None:
         f"k_delete should be TOMBSTONE in newest SST, got {sst_tombstone[1]!r}"
     )
 
+    wal_path = os.path.join(DATA_DIR, "wal.log")
+    wal_size_before = os.path.getsize(wal_path)
+    print(f"\n[Checkpoint] wal.log size before compaction: {wal_size_before} bytes")
+
     # 3. 触发一次全量 compaction
     print("\n[Compaction] Run compact_all() ...")
     old_sst_paths = [s.path for s in kv.sst_files]
@@ -161,6 +165,13 @@ def phase2_second_run() -> None:
 
     assert new_count <= old_count, "SST file count should not increase after compaction"
     assert new_count >= 0
+
+    wal_size_after = os.path.getsize(wal_path)
+    print(f"\n[Checkpoint] wal.log size after compaction: {wal_size_after} bytes")
+    # 理论上应该是明显变小（通常直接归零）
+    assert wal_size_after <= wal_size_before, "wal.log should not grow after checkpoint"
+    # 如果你期望是 0，可以更强一点：
+    # assert wal_size_after == 0
 
     # 4. 验证：删除 key 已被“物理删除”，且 get 行为不变
 

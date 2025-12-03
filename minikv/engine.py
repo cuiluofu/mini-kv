@@ -377,3 +377,15 @@ class MiniKV:
         new_sst = SSTFile.write_from_memtable(path=path,memtable=merged)
 
         self.sst_files.append(new_sst)
+
+        # 5. 做一次 WAL checkpoint：此时所有状态都在 SST 里了，
+        #    安全地丢弃旧 WAL，把它重置为空。
+        if self.wal is not None:
+            # 先关闭当前 WAL 文件句柄
+            self.wal.close()
+
+            # 直接 truncate：用 "w" 模式重建一个空 wal.log
+            open(self.wal.path,"w").close()
+            # 重新打开 WAL，让后续 put/delete 能继续正常写日志
+            self.wal = WAL(self.wal.path)
+            self.wal.open()
