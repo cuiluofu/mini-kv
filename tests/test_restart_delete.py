@@ -112,13 +112,13 @@ def phase2_second_run() -> None:
     }
     deleted_keys = ["k_delete"]
 
-    print("\n[Check] get() on alive keys:")
+    print("\n[Check] get() on alive keys(before compaction):")
     for k, expected in alive_expect.items():
         v = kv.get(k)
         print(f"  get({k!r}) = {v!r}")
         assert v == expected, f"Key {k} expected {expected!r}, got {v!r}"
 
-    print("\n[Check] get() on deleted keys:")
+    print("\n[Check] get() on deleted keys(before compaction):")
     for k in deleted_keys:
         v = kv.get(k)
         print(f"  get({k!r}) = {v!r}")
@@ -127,7 +127,7 @@ def phase2_second_run() -> None:
     # 2. 直接访问 SST，验证：
     #    - k_delete 在“最新”的 SST 里是 TOMBSTONE
     #    - k_alive_* 至少在某个 SST 里有正确值
-    print("\n[Check] SST contents via SSTFile.search():")
+    print("\n[Check] SST contents via SSTFile.search()(before compaction):")
 
     # 2.1 deleted key 在某个 SST 里是 tombstone
     sst_tombstone = None
@@ -143,18 +143,50 @@ def phase2_second_run() -> None:
         f"k_delete should be TOMBSTONE in newest SST, got {sst_tombstone[1]!r}"
     )
 
-    # 2.2 alive keys 在某个 SST 里有正确值
+    # 3. 触发一次全量 compaction
+    print("\n[Compaction] Run compact_all() ...")
+    old_sst_paths = [s.path for s in kv.sst_files]
+    old_count = len(old_sst_paths)
+    kv.compact_all()
+    new_count = len(kv.sst_files)
+    new_paths = [s.path for s in kv.sst_files]
+
+    print(f" SST file count: {old_count} -> {new_count}")
+    print("Old SST files:")
+    for p in old_sst_paths:
+        print("     -",p)
+    print(" New SST files:")
+    for p in new_paths:
+        print("     -",p)
+
+    assert new_count <= old_count, "SST file count should not increase after compaction"
+    assert new_count >= 0
+
+    # 4. 验证：删除 key 已被“物理删除”，且 get 行为不变
+
+    # 4.1 get 逻辑视图仍然正确
+    print("\n[Check] get() on alive keys (after compaction):")
     for k, expected in alive_expect.items():
-        found = False
-        for sst in reversed(kv.sst_files):
-            v = sst.search(k)
-            if v is None:
-                continue
-            print(f"  SST {sst.path} search({k!r}) = {v!r}")
-            if v == expected:
-                found = True
-                break
-        assert found, f"Key {k} with value {expected!r} not found in any SST"
+        v = kv.get(k)
+        print(f"  get({k!r}) = {v!r}")
+        assert v == expected, f"(after compaction) Key {k} expected {expected!r}, got {v!r}"
+
+    print("\n[Check] get() on deleted keys (after compaction):")
+    for k in deleted_keys:
+        v = kv.get(k)
+        print(f"  get({k!r}) = {v!r}")
+        assert v is None, f"(after compaction) Deleted key {k} should return None, got {v!r}"
+
+    # 4.2 物理检查：新生成的 SST 中，不再有 k_delete 行
+    print("\n[Check] SST files physically (after compaction):")
+    for sst in kv.sst_files:
+        print(f"  Inspect {sst.path}:")
+        with open(sst.path, "r", encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                k, v = line.rstrip("\n").split("\t", 1)
+                assert k != "k_delete", "Deleted key k_delete should not appear in compacted SST"
 
     print("\nAll checks passed ✅")
     print("=== [Phase 2] Done ===")

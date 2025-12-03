@@ -7,6 +7,7 @@ import os
 
 TOMBSTONE = "__MINIKV_TOMBSTONE__"
 
+
 class MiniKV:
     """
     MiniKV引擎： 提供 put/get/delete 等对外接口、
@@ -67,7 +68,7 @@ class MiniKV:
         self._flush_to_sst()
 
         if self.wal is not None:
-            self._sync_wal_now() # 确保 WAL 落盘
+            self._sync_wal_now()  # 确保 WAL 落盘
             self.wal.close()
             self.wal = None
 
@@ -300,7 +301,6 @@ class MiniKV:
             # min_key / max_key 先保持 None，search() 时懒加载
             self.sst_files.append(sst)
 
-
     def compact_all(self) -> None:
         """
         手动触发一次“全量 compaction”
@@ -315,4 +315,65 @@ class MiniKV:
         注意：
         - 当前是一个“暂停世界”的简单实现，没有任何并发/后台线程
         """
-        raise NotImplementedError
+        self._ensure_open()
+
+        # 1. 先把当前 memtable 刷一下，确保所有更新都进入 SST
+        #    （如果 memtable 为空，这一步就是 no-op）
+
+        self._flush_to_sst()
+
+        # 如果连一个 SST 都没有则直接返回不compact
+        if not self.sst_files:
+            return
+
+        # 2. 从“新到旧”遍历 SST，构建最新视图
+        # merged: 记录每个 key 的“最新非删除值”
+        # deleted: 记录最新观察到是 TOMBSTONE 的 key
+        merged: dict[str, str] = {}
+        deleted: set[str] = set()
+
+        # 注意：self.sst_files 是“老到新”，我们要从“新到老”看
+        for sst in reversed(self.sst_files):
+            if not os.path.exists(self.config.data_dir):
+                continue
+
+            with open(sst.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+
+                    parts = line.split("\t", 1)
+                    if len(parts) != 2:
+                        continue
+                    k, v = parts
+                    # 如果这个 key 在更“新”的 SST 里已经见过（无论是删除还是保留），跳过
+                    if k in merged or k in deleted:
+                        continue
+                    # 最新记录是 tombstone：标记为删除，不写入 merged
+                    if v == TOMBSTONE:
+                        deleted.add(k)
+                    else:
+                        merged[k] = v
+
+        # 3. 删除所有旧的 SST 文件
+        for sst in self.sst_files:
+            try:
+                os.remove(sst.path)
+            except FileNotFoundError:
+                pass
+        # 重置 in-memory 的 sst_files 列表
+        self.sst_files = []
+
+        # 如果合并结果里一个 key 都没有，那就直接返回（磁盘上不再有 SST）
+        if not merged:
+            return
+        # 4. 写入一个“合并后的新 SST”
+        #    _next_sst_path() 会基于当前 self.sst_files 长度生成文件名，
+        #    这里长度是 0，所以是 sst_0000.txt（干净的世界）
+        path = self._next_sst_path()
+
+        # 这里让 write_from_memtable 自己处理排序逻辑；
+        new_sst = SSTFile.write_from_memtable(path=path,memtable=merged)
+
+        self.sst_files.append(new_sst)
