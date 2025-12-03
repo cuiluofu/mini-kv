@@ -1,7 +1,7 @@
 from typing import Optional, TextIO
 import os
 
-
+TOMBSTONE = "__MINIKV_TOMBSTONE__"
 class WAL:
     """
     Write-Ahead Log 抽象：
@@ -113,7 +113,8 @@ class WAL:
                 elif op == "DEL" and len(parts) >= 2:
                     # 格式：DEL\tkey
                     key = parts[1]
-                    memtable.pop(key, None)
+                    value = TOMBSTONE
+                    memtable[key] = value
                 else:
                     # 非法行：目前先忽略
                     # TODO: 未来可以加日志记录或抛异常

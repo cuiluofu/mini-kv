@@ -46,7 +46,11 @@ class SSTFile:
         # 如果文件不存在，直接返回None
         if not os.path.exists(self.path):
             return None
-        # 根据查询的key所属范围剪枝
+
+        # 懒加载 min_key / max_key（老 SST 第一次被访问时才做一次扫）
+        self._ensure_min_max_loaded()
+
+        # 如果已经有了范围信息，先剪枝
         if self.min_key is not None and self.max_key is not None:
             if key < self.min_key or key > self.max_key:
                 return None
@@ -72,3 +76,37 @@ class SSTFile:
 
             # 全文件扫描完没找到
             return None
+
+    def _ensure_min_max_loaded(self) -> None:
+        """
+        懒加载 min_key / max_key：
+        - 如果已经有值，直接返回
+        - 如果还没有，就顺序扫一遍文件，拿到首行和末行的 key
+        """
+        if self.min_key is not None and self.max_key is not None:
+            return
+
+        if not os.path.exists(self.path):
+            return
+
+        first_key: str | None = None
+        last_key: str | None = None
+
+        with open(self.path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\n")
+                if not line:
+                    continue
+
+                parts = line.split("\t", 1)
+                if len(parts) != 2:
+                    continue
+
+                k, _ = parts
+                if first_key is None:
+                    first_key = k
+                last_key = k
+
+        self.min_key = first_key
+        self.max_key = last_key
+
