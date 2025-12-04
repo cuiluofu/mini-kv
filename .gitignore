@@ -1,0 +1,32 @@
+# ---- Python bytecode / cache ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---- Virtual environments ----
+.env
+.venv
+env/
+venv/
+ENV/
+
+# ---- IDE / editor configs ----
+.idea/
+.vscode/
+
+# ---- OS-specific junk ----
+.DS_Store
+Thumbs.db
+
+# ---- Logs & temp files ----
+*.log
+*.tmp
+
+# ---- MiniKV data / artifacts ----
+data/
+data_*/
+bench_data_*/
+*.sst
+
+# ---- Test artifacts ----
+test.sst
