@@ -1,13 +1,14 @@
 from enum import Enum
 
 class WriteMode(Enum):
-    """WAL 落盘策略"""
-    SYNC = 1    # 每次写后立刻fsync
-    BATCH = 2   # 固定批量fsync
-    ADAPTIVE = 3    # 自适应批量fsync
+    """Supported WAL persistence strategies."""
+    SYNC = 1        # Forces fsync after every write operation
+    BATCH = 2       # Groups multiple WAL writes before performing fsync
+    ADAPTIVE = 3    # Dynamically adjusts batch size based on workload characteristics
+
 
 class MiniKVConfig:
-    """MiniKV 引擎的配置项"""
+    """Configuration parameters for the MiniKV storage engine."""
 
     def __init__(
         self,
@@ -18,16 +19,22 @@ class MiniKVConfig:
         memtable_limit: int = 1000,
     ):
         """
-        参数说明：
-        - data_dir: 数据目录（WAL / SST 都放在这里）
-        - write_mode: WAL 落盘模式（SYNC/BATCH/ADAPTIVE）
-        - batch_size: BATCH/ADAPTIVE 模式下，目标批量条数
-        - batch_interval_ms: BATCH/ADAPTIVE 模式下，定时 fsync 的时间间隔
-        - memtable_limit: 触发 flush 的 MemTable 最大 key 数量
+        Initializes configuration settings for the engine.
+
+        Attributes:
+          - data_dir:
+                Base directory where WAL and SST files are stored.
+          - write_mode:
+                WAL persistence policy (SYNC / BATCH / ADAPTIVE).
+          - batch_size:
+                Target number of WAL records per fsync in BATCH or ADAPTIVE mode.
+          - batch_interval_ms:
+                Time-based fsync interval used in BATCH or ADAPTIVE mode.
+          - memtable_limit:
+                Maximum number of keys in the MemTable before a flush is triggered.
         """
         self.data_dir = data_dir
         self.write_mode = write_mode
         self.batch_size = batch_size
         self.batch_interval_ms = batch_interval_ms
         self.memtable_limit = memtable_limit
-        

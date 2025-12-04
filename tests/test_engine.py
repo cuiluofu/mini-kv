@@ -3,23 +3,43 @@ import os
 import tempfile
 
 from minikv.engine import MiniKV
-from minikv.config import MiniKVConfig, WriteMode  # 路径按你的工程来改
+from minikv.config import MiniKVConfig, WriteMode
 
 
 def make_config(tmpdir: str) -> MiniKVConfig:
+    """
+    Constructs a MiniKVConfig instance targeting the given temporary directory.
 
+    The write mode is fixed to SYNC for determinism; other parameters
+    rely on their default values.
+    """
     return MiniKVConfig(
         data_dir=tmpdir,
         write_mode=WriteMode.SYNC,
-        # 其他参数用默认值
     )
 
 
-def test_minikv_replay_basic():
+def test_minikv_replay_basic() -> None:
+    """
+    Verifies that WAL replay correctly restores the latest key-value state.
+
+    Scenario:
+      1) First run:
+           - Open engine
+           - Put k1, k2
+           - Delete k1
+           - Close engine (WAL is persisted)
+      2) Second run:
+           - Open engine with the same config
+           - Replay WAL into MemTable
+           - Verify:
+               * k1 is logically deleted (get returns None)
+               * k2 retains its latest value
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         cfg = make_config(tmpdir)
 
-        # 第一次启动：写入数据并关闭
+        # First run: apply a sequence of updates and close the engine.
         kv1 = MiniKV(cfg)
         kv1.open()
         kv1.put("k1", "v1")
@@ -27,7 +47,7 @@ def test_minikv_replay_basic():
         kv1.delete("k1")
         kv1.close()
 
-        # 第二次启动：通过 WAL replay 恢复 memtable
+        # Second run: WAL replay should reconstruct the final state.
         kv2 = MiniKV(cfg)
         kv2.open()
         assert kv2.get("k1") is None

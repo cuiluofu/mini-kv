@@ -1,14 +1,28 @@
 import os
 import tempfile
 
-from minikv.wal import WAL
+from minikv.wal import WAL, TOMBSTONE
 
 
-def test_wal_replay_basic():
-    # 1. 创建一个临时目录，避免污染真实工程目录
+def test_wal_replay_basic() -> None:
+    """
+    Validates basic WAL replay behavior.
+
+    Scenario:
+      1) Create a WAL file and append:
+           - PUT a=1
+           - PUT b=2
+           - DEL a
+      2) Close the WAL.
+      3) Reopen the WAL and replay its contents into an empty MemTable.
+      4) Final state should contain:
+             b → "2"
+         and key 'a' should be represented as a tombstone and therefore omitted.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         wal_path = os.path.join(tmpdir, "wal.log")
-        # 2. 第一次：写 WAL
+
+        # First run: generate WAL contents.
         wal = WAL(wal_path)
         wal.open()
         wal.append_put("a", "1")
@@ -16,19 +30,26 @@ def test_wal_replay_basic():
         wal.append_delete("a")
         wal.close()
 
-        # 3. 第二次,重启后 replay
+        # Second run: replay WAL content.
         memtable = {}
         wal2 = WAL(wal_path)
         wal2.replay_into(memtable)
 
-        # 4. 检查最终状态
+        # Expected: key "a" was deleted; only "b" remains.
         assert memtable == {"b": "2"}
         print("✅ test_wal_replay_basic passed:", memtable)
 
-def test_wal_replay_empty_file():
+
+def test_wal_replay_empty_file() -> None:
+    """
+    Ensures replay_into() correctly handles an empty WAL file:
+      - No operations should be applied.
+      - The MemTable remains empty.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
         wal_path = os.path.join(tmpdir, "wal.log")
 
+        # Create an empty file.
         open(wal_path, "w").close()
 
         memtable = {}
@@ -38,9 +59,15 @@ def test_wal_replay_empty_file():
         assert memtable == {}
         print("✅ test_wal_replay_empty_file passed:", memtable)
 
-def test_wal_replay_file_not_exist():
+
+def test_wal_replay_file_not_exist() -> None:
+    """
+    Ensures replay_into() is tolerant of a missing WAL file:
+      - No exception should be raised.
+      - MemTable remains empty.
+    """
     with tempfile.TemporaryDirectory() as tmpdir:
-        wal_path = os.path.join(tmpdir, "wal.log")  # 注意：不创建
+        wal_path = os.path.join(tmpdir, "wal.log")  # File not created
 
         memtable = {}
         wal = WAL(wal_path)
@@ -48,6 +75,7 @@ def test_wal_replay_file_not_exist():
 
         assert memtable == {}
         print("✅ test_wal_replay_file_not_exist passed:", memtable)
+
 
 if __name__ == "__main__":
     test_wal_replay_basic()

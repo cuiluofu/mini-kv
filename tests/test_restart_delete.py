@@ -1,27 +1,39 @@
 """
-测试目标：
-1）第一次运行：写入 + 删除，确保触发 flush，close；
-2）第二次运行：重启后 open（加载 SST + 重放 WAL），验证：
-   - 正常 key: get 拿到值
-   - 删除 key: get 返回 None
-   - SST 里确实有 tombstone 记录
+test_restart_delete.py
 
-用法：
-  第一阶段（写入并关闭）：
-    python test_restart_delete.py 1
+Test objectives:
+  1) First run:
+       - Perform a sequence of puts and deletes that triggers MemTable flushes
+         and produces multiple SST files.
+       - Ensure at least one live key and one deleted key whose tombstone
+         is flushed into SSTs.
+       - Close the engine to persist WAL and SST state.
+  2) Second run:
+       - Re-open the engine using the same data directory.
+       - Verify that:
+           * Live keys can still be read correctly.
+           * Deleted keys return None through the public get() API.
+           * Tombstone records truly reside in SST files (not only in WAL).
+       - Run a full compaction and verify:
+           * Logical behavior (get) remains unchanged.
+           * The deleted key is physically removed from compacted SSTs.
+           * WAL is checkpointed and shrinks on disk.
 
-  第二阶段（重启后验证）：
-    python test_restart_delete.py 2
+Usage:
+  Phase 1 only (write and close):
+      python test_restart_delete.py 1
 
-  或者在同一进程里连续做两阶段（不是严格“重启”，但方便快速自测）：
-    python test_restart_delete.py both
+  Phase 2 only (reopen and verify):
+      python test_restart_delete.py 2
+
+  Run both phases in a single process (not a real restart but convenient):
+      python test_restart_delete.py both
 """
 
 import os
 import shutil
 import sys
 
-# 如果你的包名不是 mini_kv，这几行自己改一下
 from minikv.config import MiniKVConfig, WriteMode
 from minikv.engine import MiniKV, TOMBSTONE
 
@@ -31,28 +43,29 @@ DATA_DIR = "data_restart_test"
 
 def make_config() -> MiniKVConfig:
     """
-    配一个单独的数据目录 + 小一点的 memtable_limit，
-    方便我们在少量 put/delete 下就触发 flush。
+    Constructs a configuration that uses a dedicated data directory and
+    a small MemTable limit, so that flushes are triggered with only a few writes.
     """
     return MiniKVConfig(
         data_dir=DATA_DIR,
-        write_mode=WriteMode.SYNC,  # 简化：每次都 fsync，避免“没落盘”干扰测试
-        memtable_limit=2,           # 2 条就触发 flush，方便制造多个 SST
+        write_mode=WriteMode.SYNC,  # Deterministic: fsync on each write
+        memtable_limit=2,           # Flush after 2 entries to create multiple SSTs
     )
 
 
 def phase1_first_run() -> None:
     """
-    第一次运行：
-    - 清空旧数据目录
-    - open
-    - 连续 put / delete，制造：
-        * 至少一个普通 key
-        * 至少一个被删 key（写入过，再 tombstone）
-      且 tombstone 要被 flush 到 SST
-    - close
+    Phase 1: initial run.
+
+    Steps:
+      - Remove any existing data directory for a clean environment.
+      - Open the engine.
+      - Execute a sequence of put/delete operations that:
+          * Produces a set of SST files.
+          * Ensures that at least one key is flushed as a tombstone.
+      - Close the engine to persist state.
     """
-    # 先清理掉历史数据，保证是一个干净场景
+    # Start from a clean state.
     shutil.rmtree(DATA_DIR, ignore_errors=True)
 
     config = make_config()
@@ -61,22 +74,22 @@ def phase1_first_run() -> None:
 
     print("=== [Phase 1] Start ===")
 
-    # memtable_limit=2，下面这些操作会产生多次 flush：
-    # 第一次 flush: 包含 k_alive_1, k_delete (value)
+    # With memtable_limit=2, these operations cause multiple flushes:
+    # First flush:  contains k_alive_1 and k_delete (with a non-tombstone value).
     kv.put("k_alive_1", "v1")
     kv.put("k_delete", "temp_value")
 
-    # 第二次 flush: 包含 k_alive_2, k_delete (TOMBSTONE)
+    # Second flush: contains k_alive_2 and k_delete (as TOMBSTONE).
     kv.put("k_alive_2", "v2")
     kv.delete("k_delete")
 
-    # 第三次 flush: close() 时把 k_alive_3 刷出去
+    # Third flush: produced at close() for k_alive_3.
     kv.put("k_alive_3", "v3")
 
     print(f"memtable before close: {kv.memtable}")
     kv.close()
 
-    # 看一下当前 data_dir 里有什么
+    # Inspect data directory contents after phase 1.
     print("Files in data dir after phase1:")
     for name in sorted(os.listdir(DATA_DIR)):
         print("  -", name)
@@ -86,14 +99,23 @@ def phase1_first_run() -> None:
 
 def phase2_second_run() -> None:
     """
-    第二次运行：
-    - 用同一个 data_dir 再次构建 MiniKV，open()
-      （内部会 lazy 加载 SST 列表 + 打开 WAL + replay）
-    - 验证：
-        * k_alive_* 能拿到正确值
-        * k_delete 返回 None（删除语义）
-    - 额外：直接用 SSTFile.search 验证 SST 中 tombstone 的存在，
-      证明“删除”已经物化到 SST，而不是仅靠 WAL replay。
+    Phase 2: restart and verification.
+
+    Steps:
+      - Reconstruct a MiniKV instance using the same data directory.
+      - Open the engine, which will:
+          * Lazily load SST metadata.
+          * Open the WAL.
+          * Replay WAL into the MemTable.
+      - Verify via get():
+          * Live keys return the expected values.
+          * Deleted keys return None.
+      - Directly inspect SST contents to:
+          * Confirm that the deleted key appears as a tombstone in the newest SST.
+      - Trigger a full compaction and:
+          * Verify that the logical view via get() is unchanged.
+          * Confirm that the deleted key is physically absent from the compacted SSTs.
+          * Check that WAL is checkpointed (size does not increase and usually shrinks).
     """
     config = make_config()
     kv = MiniKV(config)
@@ -104,7 +126,7 @@ def phase2_second_run() -> None:
     for sst in kv.sst_files:
         print("  -", sst.path)
 
-    # 1. 用对外接口 get() 验证“逻辑视图”
+    # 1. Verify logical view through the public get() API.
     alive_expect = {
         "k_alive_1": "v1",
         "k_alive_2": "v2",
@@ -112,26 +134,25 @@ def phase2_second_run() -> None:
     }
     deleted_keys = ["k_delete"]
 
-    print("\n[Check] get() on alive keys(before compaction):")
+    print("\n[Check] get() on alive keys (before compaction):")
     for k, expected in alive_expect.items():
         v = kv.get(k)
         print(f"  get({k!r}) = {v!r}")
         assert v == expected, f"Key {k} expected {expected!r}, got {v!r}"
 
-    print("\n[Check] get() on deleted keys(before compaction):")
+    print("\n[Check] get() on deleted keys (before compaction):")
     for k in deleted_keys:
         v = kv.get(k)
         print(f"  get({k!r}) = {v!r}")
         assert v is None, f"Deleted key {k} should return None, got {v!r}"
 
-    # 2. 直接访问 SST，验证：
-    #    - k_delete 在“最新”的 SST 里是 TOMBSTONE
-    #    - k_alive_* 至少在某个 SST 里有正确值
-    print("\n[Check] SST contents via SSTFile.search()(before compaction):")
+    # 2. Directly inspect SST files to confirm tombstone materialization:
+    #    - The newest SST should contain k_delete as TOMBSTONE.
+    #    - Live keys should be present with correct values in some SST.
+    print("\n[Check] SST contents via SSTFile.search() (before compaction):")
 
-    # 2.1 deleted key 在某个 SST 里是 tombstone
     sst_tombstone = None
-    for sst in reversed(kv.sst_files):  # 新到旧
+    for sst in reversed(kv.sst_files):  # Newest to oldest
         v = sst.search("k_delete")
         if v is not None:
             sst_tombstone = (sst.path, v)
@@ -147,7 +168,7 @@ def phase2_second_run() -> None:
     wal_size_before = os.path.getsize(wal_path)
     print(f"\n[Checkpoint] wal.log size before compaction: {wal_size_before} bytes")
 
-    # 3. 触发一次全量 compaction
+    # 3. Trigger a full compaction and inspect the resulting SST layout.
     print("\n[Compaction] Run compact_all() ...")
     old_sst_paths = [s.path for s in kv.sst_files]
     old_count = len(old_sst_paths)
@@ -158,37 +179,40 @@ def phase2_second_run() -> None:
     print(f" SST file count: {old_count} -> {new_count}")
     print("Old SST files:")
     for p in old_sst_paths:
-        print("     -",p)
+        print("     -", p)
     print(" New SST files:")
     for p in new_paths:
-        print("     -",p)
+        print("     -", p)
 
     assert new_count <= old_count, "SST file count should not increase after compaction"
     assert new_count >= 0
 
     wal_size_after = os.path.getsize(wal_path)
     print(f"\n[Checkpoint] wal.log size after compaction: {wal_size_after} bytes")
-    # 理论上应该是明显变小（通常直接归零）
+    # WAL is expected to shrink (often to zero) after checkpoint.
     assert wal_size_after <= wal_size_before, "wal.log should not grow after checkpoint"
-    # 如果你期望是 0，可以更强一点：
+    # For stricter expectations, this could be:
     # assert wal_size_after == 0
 
-    # 4. 验证：删除 key 已被“物理删除”，且 get 行为不变
+    # 4. Verify that logical behavior remains correct after compaction.
 
-    # 4.1 get 逻辑视图仍然正确
     print("\n[Check] get() on alive keys (after compaction):")
     for k, expected in alive_expect.items():
         v = kv.get(k)
         print(f"  get({k!r}) = {v!r}")
-        assert v == expected, f"(after compaction) Key {k} expected {expected!r}, got {v!r}"
+        assert v == expected, (
+            f"(after compaction) Key {k} expected {expected!r}, got {v!r}"
+        )
 
     print("\n[Check] get() on deleted keys (after compaction):")
     for k in deleted_keys:
         v = kv.get(k)
         print(f"  get({k!r}) = {v!r}")
-        assert v is None, f"(after compaction) Deleted key {k} should return None, got {v!r}"
+        assert v is None, (
+            f"(after compaction) Deleted key {k} should return None, got {v!r}"
+        )
 
-    # 4.2 物理检查：新生成的 SST 中，不再有 k_delete 行
+    # 4.2 Physical verification: compacted SSTs must not contain k_delete.
     print("\n[Check] SST files physically (after compaction):")
     for sst in kv.sst_files:
         print(f"  Inspect {sst.path}:")
@@ -197,13 +221,23 @@ def phase2_second_run() -> None:
                 if not line.strip():
                     continue
                 k, v = line.rstrip("\n").split("\t", 1)
-                assert k != "k_delete", "Deleted key k_delete should not appear in compacted SST"
+                assert k != "k_delete", (
+                    "Deleted key k_delete should not appear in compacted SST"
+                )
 
     print("\nAll checks passed ✅")
     print("=== [Phase 2] Done ===")
 
 
-def main():
+def main() -> None:
+    """
+    Entry point for the restart + delete + compaction test.
+
+    Command-line arguments:
+      1      Run phase 1 only (initial write and close).
+      2      Run phase 2 only (restart, verify, compact).
+      both   Run both phases sequentially in a single process.
+    """
     arg = sys.argv[1] if len(sys.argv) >= 2 else "both"
     if arg == "1":
         phase1_first_run()

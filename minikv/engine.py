@@ -3,6 +3,8 @@ from typing import Optional
 from .config import MiniKVConfig, WriteMode
 from .wal import WAL
 from .sst import SSTFile
+from . import compaction
+
 import os
 
 TOMBSTONE = "__MINIKV_TOMBSTONE__"
@@ -10,65 +12,79 @@ TOMBSTONE = "__MINIKV_TOMBSTONE__"
 
 class MiniKV:
     """
-    MiniKV引擎： 提供 put/get/delete 等对外接口、
-    内部由 WAL + MemTable +SST files + Compaction 组成、
+    Core MiniKV storage engine.
+
+    Exposes a simple key-value interface (put/get/delete) and internally
+    relies on WAL + MemTable + SST files + compaction to provide durability
+    and crash recovery.
     """
 
     def __init__(self, config: MiniKVConfig):
         """
-        创建一个 MiniKV 实例，但不立刻打开文件。
-        需要调用 open() 才会真正加载 WAL/SST 等
+        Constructs a MiniKV instance without opening any files.
+
+        The actual I/O resources (WAL, SST metadata, etc.) are initialized
+        lazily when open() is invoked.
         """
         self.config = config
         self.memtable = {}
-        self.sst_files = []  # 未来可以用来存路径或元数据
-        self.wal: Optional[WAL] = None  # 未来会变成 WAL 对象
+        self.sst_files = []                 # In-memory list of SSTFile descriptors
+        self.wal: Optional[WAL] = None      # WAL instance, initialized on open()
         self._is_open = False
         self._pending_wal_ops = 0
         self._last_sync_time = 0.0
         self._adaptive_batch_size = config.batch_size
+        self._fsync_count = 0               # Number of times wal.sync() has been invoked
 
     def open(self) -> None:
         """
-        打开引擎：
-        - 创建数据目录（如不存在）
-        - 打开或创建 WAL
-        - 加载已有 SST 文件元数据 (暂时没有)
-        - replay WAL，重建 MemTable
+        Opens the engine and reconstructs in-memory state.
+
+        Steps:
+          - Marks the engine as open.
+          - Initializes an empty MemTable.
+          - Loads existing SST file descriptors (lazy metadata only).
+          - Opens or creates the WAL file.
+          - Replays the WAL into the MemTable.
         """
         if self._is_open:
             return
 
-        # 1. 标记为open
+        # 1. Mark engine as open.
         self._is_open = True
-        # 2、 初始化 memtable
-        self.memtable = {}  # 清空 memtable
 
-        # 先加载已有 SST 列表（只建对象，不扫内容）
+        # 2. Initialize an empty MemTable.
+        self.memtable = {}
+
+        # Load existing SST descriptors without scanning contents.
         self._load_sst_files()
 
-        # 3. 创建 WAL 实例，并打开文件
+        # 3. Create the WAL instance and open the log file.
         wal_path = self._build_wal_path()
         self.wal = WAL(wal_path)
         self.wal.open()
 
-        # 4. 从 WAL replay 到 memtable
+        # 4. Replay WAL records to reconstruct the MemTable.
         self._replay_wal()
 
     def close(self) -> None:
-        """ 关闭引擎：
-        - flush MemTable
-        - 关闭 WAL
-        Milestone 1 ： 以内存方式关闭 KV 引擎
-        - 只修改状态，不做flush、也没有 WAL
+        """
+        Closes the engine and releases associated resources.
+
+        Current behavior:
+          - Flushes the remaining MemTable to SST.
+          - Flushes and closes the WAL if present.
+          - Marks the engine as closed.
         """
         if not self._is_open:
             return
-        # 先 flush 一下剩余的 MemTable
+
+        # Flush remaining in-memory state to SST.
         self._flush_to_sst()
 
         if self.wal is not None:
-            self._sync_wal_now()  # 确保 WAL 落盘
+            # Ensure WAL contents are durably persisted.
+            self._sync_wal_now()
             self.wal.close()
             self.wal = None
 
@@ -76,66 +92,66 @@ class MiniKV:
 
     def put(self, key: str, value: str) -> None:
         """
-        写入一个 key-value:
-        - 写 WAL (根据 write_mode 决定是否/何时 fsync)
-        - 更新 MemTable
+        Inserts or updates a key-value pair.
+
+        Write path:
+          - Appends a PUT record to the WAL (fsync policy depends on write_mode).
+          - Updates the in-memory MemTable.
+          - Optionally triggers a MemTable flush when the size threshold is reached.
         """
         self._ensure_open()
-        # 1. 先写 WAL
+
+        # 1. Append to WAL.
         self._ensure_wal_initialized()
         self.wal.append_put(key, value)
 
-        # 2. 暂时立刻sync一下，后面再换成策略
+        # 2. Update WAL-related accounting and apply the chosen sync policy.
         self._pending_wal_ops += 1
         self._after_wal_append()
 
-        # 3. 再更新内存
+        # 3. Apply the update to the MemTable.
         self.memtable[key] = value
         self._maybe_flush_memtable()
 
     def get(self, key: str) -> Optional[str]:
         """
-        读取 key:
-        - 先查 MemTable
-        - 再查 SST (从新到旧)
-        如果不存在，返回 None
-        Milestone 1:
-        - 先检查 is_open
-        - 再从memtable里查，如果存在，返回对应的字符串；如果不存在，返回None
+        Retrieves the value associated with the given key.
+
+        Lookup order:
+          - First consults the MemTable.
+          - Then searches SST files from newest to oldest.
+
+        Behavior:
+          - Returns the latest non-tombstone value if present.
+          - Returns None if the key is not found or is logically deleted.
         """
         self._ensure_open()
 
-        if key in self.memtable:
-            val = self.memtable[key]
+        # 1. Check the MemTable.
+        val = self.memtable.get(key)
+        if val is not None:
             if val == TOMBSTONE:
                 return None
             return val
 
+        # 2. Scan SST files from newest to oldest.
         for sst in reversed(self.sst_files):
             val = sst.search(key)
+            if val is None:
+                continue
             if val == TOMBSTONE:
                 return None
-
             return val
 
         return None
-
-        # 1. 先查 MemTable
-        if key in self.memtable and self.memtable[key] != TOMBSTONE:
-            return self.memtable.get(key)
-        # 2. 再按“新到旧”的顺序查SST
-        for sst in reversed(self.sst_files):
-            value = sst.search(key)
-            if value is not None and value != TOMBSTONE:
-                return value
-
-        return None
-
     def delete(self, key: str) -> None:
         """
-        删除 key:
-        - 写 WAL (记录 delete 操作)
-        - 在 MemTable 中标记为删除 (tombstone)
+        Issues a logical deletion for the specified key.
+
+        Workflow:
+          - Appends a DELETE record to the WAL.
+          - Marks the key as deleted in the MemTable using a tombstone.
+          - Applies the configured WAL persistence policy.
         """
         self._ensure_open()
 
@@ -145,57 +161,73 @@ class MiniKV:
         self._pending_wal_ops += 1
         self._after_wal_append()
 
-        # 再从 memtable 中删除（存在才删）
+        # Record tombstone in the MemTable (logical deletion).
         self.memtable[key] = TOMBSTONE
         self._maybe_flush_memtable()
 
     def _append_wal(self, op_type: str, key: str, value: Optional[str]) -> None:
-        """向 WAL 追加一条记录，具体格式后面再定。"""
+        """Low-level WAL append hook (reserved for future customization)."""
         raise NotImplementedError
 
     def _maybe_flush_memtable(self) -> None:
-        """在每次写后检查是否需要 flush MemTable"""
+        """
+        Checks whether the MemTable size exceeds the configured threshold,
+        and triggers a flush to SST if necessary.
+        """
         if len(self.memtable) >= self.config.memtable_limit:
             self._flush_to_sst()
 
     def _flush_to_sst(self) -> None:
-        """把当前 MemTable 刷成一个新的 SST 文件"""
-        # 1. 构造文件路径，例如 data_dir / sst_0001.txt
-        # 2. 调用 SSTFile.write_from_memtable(...)
-        # 3. 把返回的 SSTFile 对象 append 到 self.sst_files
-        # 4. 清空 memtable
+        """
+        Flushes the current MemTable into a new SST segment.
+
+        Steps:
+          - Constructs the output SST file path.
+          - Emits the SST via SSTFile.write_from_memtable().
+          - Registers the SST in the in-memory SST list.
+          - Resets the MemTable.
+        """
         if not self.memtable:
             return
+
         path = self._next_sst_path()
         sst = SSTFile.write_from_memtable(path=path, memtable=self.memtable)
         self.sst_files.append(sst)
 
-        # 刷盘后， 清空 Memtable
+        # Reset MemTable after flush.
         self.memtable = {}
 
     def _replay_wal(self) -> None:
-        """启动时 replay WAL, 重建 MemTable """
+        """
+        Replays WAL records during engine startup to reconstruct
+        the latest in-memory MemTable state.
+        """
         if self.wal is None:
             return
-        # 将 wal 中记录的操作按顺序应用到 memtable
+
         self.wal.replay_into(self.memtable)
 
     def _ensure_open(self) -> None:
+        """Ensures that the engine is open before performing any operation."""
         if not self._is_open:
             raise RuntimeError("MiniKV is not open")
 
     def _ensure_wal_initialized(self) -> None:
+        """Ensures that the WAL object has been created and initialized."""
         if self.wal is None:
             raise RuntimeError("WAL is not initialized")
 
     def _build_wal_path(self) -> str:
-        # 确保 data_dir 存在
+        """
+        Returns the filesystem path for the WAL file and ensures
+        that the storage directory exists.
+        """
         os.makedirs(self.config.data_dir, exist_ok=True)
         return os.path.join(self.config.data_dir, "wal.log")
 
     def _next_sst_path(self) -> str:
         """
-        根据当前已有 SST 文件数量生成新文件名。
+        Generates the next SST filename based on the current number of SST files.
         """
         os.makedirs(self.config.data_dir, exist_ok=True)
         index = len(self.sst_files)
@@ -204,7 +236,12 @@ class MiniKV:
 
     def _after_wal_append(self) -> None:
         """
-        每追加一条 WAL 记录后，根据 write_mode决定是否触发sync()
+        Applies the configured WAL persistence policy after a WAL append.
+
+        Supported policies:
+          - SYNC:      fsync after each operation.
+          - BATCH:     fsync periodically or after accumulating a batch.
+          - ADAPTIVE:  dynamically adjusts the batch size.
         """
         mode = self.config.write_mode
         if mode == WriteMode.SYNC:
@@ -216,32 +253,41 @@ class MiniKV:
 
     def _sync_wal_now(self) -> None:
         """
-        每次写入 WAL 都刷
+        Forces an immediate WAL sync.
+
+        Updates:
+          - Resets the pending-WAL-ops counter.
+          - Records sync timestamp for future batch/adaptive policies.
+          - Maintains internal fsync statistics for adaptive tuning.
         """
         if self.wal is None:
             return
+
         now = time.time()
-        if self._last_sync_time == 0.0:
-            elapsed = None
-        else:
-            elapsed = now - self._last_sync_time
+        elapsed = None if self._last_sync_time == 0.0 else now - self._last_sync_time
         pending = self._pending_wal_ops
+
         self.wal.sync()
+        self._fsync_count += 1
         self._pending_wal_ops = 0
         self._last_sync_time = now
 
-        # 更新 QPS 估计
+        # Estimate QPS and update the adaptive batch size if applicable.
         if elapsed is not None and elapsed > 0 and pending > 0:
             qps = pending / elapsed
             self._update_adaptive_batch_size(qps)
 
     def _maybe_sync_batch(self) -> None:
         """
-        若写满 batch_size条再sync
-        活着距离上次sync超过batch_interval_ms即sync
+        Implements the fixed-batch WAL sync policy.
+
+        A sync is triggered when:
+          - The number of pending WAL writes reaches 'batch_size', or
+          - The time since the last sync exceeds 'batch_interval_ms'.
         """
         if self.wal is None:
             return
+
         if self._pending_wal_ops >= self.config.batch_size:
             self._sync_wal_now()
             return
@@ -252,6 +298,10 @@ class MiniKV:
             self._sync_wal_now()
 
     def _maybe_sync_adaptive(self) -> None:
+        """
+        Implements an adaptive WAL syncing strategy that tunes
+        batch size based on observed write throughput.
+        """
         if self.wal is None:
             return
 
@@ -265,22 +315,34 @@ class MiniKV:
             self._sync_wal_now()
 
     def _update_adaptive_batch_size(self, qps: float) -> None:
+        """
+        Adjusts the adaptive WAL batch size based on observed write throughput.
+
+        Logic:
+          - If throughput is high, larger batches reduce fsync frequency
+            and improve write efficiency.
+          - If throughput is low, a smaller batch size favors lower latency
+            and faster durability.
+        """
         base = self.config.batch_size
         LOW = 1000
         HIGH = 10000
 
         if qps >= HIGH:
-            # 负载很高，增大批量减少 fsync 次数
+            # High throughput → increase batch size to reduce fsync overhead.
             self._adaptive_batch_size = base * 4
         elif qps <= LOW:
-            # 负载不高，保持更小的批量，提高可靠性
+            # Low throughput → revert batch size to preserve durability.
             self._adaptive_batch_size = base
 
     def _load_sst_files(self) -> None:
         """
-        懒加载已有 SST 文件：
-        - 只根据文件名构造 SSTFile 对象
-        - 不预先读取内容，也不计算 min/max（交给 SSTFile 自己懒加载）
+        Lazily loads existing SST file descriptors.
+
+        Behavior:
+          - Only constructs SSTFile objects from file names.
+          - Does not read file contents or compute key-range metadata.
+            These will be populated on-demand by SSTFile during search().
         """
         self.sst_files = []
 
@@ -290,102 +352,36 @@ class MiniKV:
 
         names = [
             name for name in os.listdir(data_dir)
-            if name.startswith('sst_') and name.endswith(".txt")
+            if name.startswith("sst_") and name.endswith(".txt")
         ]
 
-        names.sort()
+        names.sort()  # Maintains chronological ordering (sst_0000, sst_0001, ...)
 
         for name in names:
             path = os.path.join(data_dir, name)
             sst = SSTFile(path)
-            # min_key / max_key 先保持 None，search() 时懒加载
+            # Key-range metadata (min_key / max_key) is left unset
+            # and will be populated lazily during SST search.
             self.sst_files.append(sst)
+
+    @property
+    def fsync_count(self) -> int:
+        """
+        Returns the number of WAL fsync operations performed
+        during the current engine open() lifecycle.
+        """
+        return self._fsync_count
 
     def compact_all(self) -> None:
         """
-        手动触发一次“全量 compaction”
+        Public API for triggering a full compaction.
 
-        - 先 flush 当前 MemTable
-        - 把磁盘上所有 SST 全量读一遍，从“新到旧”合并成一个最新快照
-        - 最新快照中：
-            * 普通 key 保留最新值
-            * 最新记录为TOMBSTONE 的 key被物理删除（不再写入新SST）
-        - 删除旧 SST 文件，只保留一个新的合并SST
+        Current behavior:
+          - Delegates directly to compaction.compact_all(self, TOMBSTONE),
+            which performs a global merge of all SST files and checkpoints the WAL.
 
-        注意：
-        - 当前是一个“暂停世界”的简单实现，没有任何并发/后台线程
+        Future extensions:
+          - Additional compaction modes (e.g., leveled, tiered) may be selected here
+            based on configuration or runtime heuristics.
         """
-        self._ensure_open()
-
-        # 1. 先把当前 memtable 刷一下，确保所有更新都进入 SST
-        #    （如果 memtable 为空，这一步就是 no-op）
-
-        self._flush_to_sst()
-
-        # 如果连一个 SST 都没有则直接返回不compact
-        if not self.sst_files:
-            return
-
-        # 2. 从“新到旧”遍历 SST，构建最新视图
-        # merged: 记录每个 key 的“最新非删除值”
-        # deleted: 记录最新观察到是 TOMBSTONE 的 key
-        merged: dict[str, str] = {}
-        deleted: set[str] = set()
-
-        # 注意：self.sst_files 是“老到新”，我们要从“新到老”看
-        for sst in reversed(self.sst_files):
-            if not os.path.exists(self.config.data_dir):
-                continue
-
-            with open(sst.path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.rstrip("\n")
-                    if not line:
-                        continue
-
-                    parts = line.split("\t", 1)
-                    if len(parts) != 2:
-                        continue
-                    k, v = parts
-                    # 如果这个 key 在更“新”的 SST 里已经见过（无论是删除还是保留），跳过
-                    if k in merged or k in deleted:
-                        continue
-                    # 最新记录是 tombstone：标记为删除，不写入 merged
-                    if v == TOMBSTONE:
-                        deleted.add(k)
-                    else:
-                        merged[k] = v
-
-        # 3. 删除所有旧的 SST 文件
-        for sst in self.sst_files:
-            try:
-                os.remove(sst.path)
-            except FileNotFoundError:
-                pass
-        # 重置 in-memory 的 sst_files 列表
-        self.sst_files = []
-
-        # 如果合并结果里一个 key 都没有，那就直接返回（磁盘上不再有 SST）
-        if not merged:
-            return
-        # 4. 写入一个“合并后的新 SST”
-        #    _next_sst_path() 会基于当前 self.sst_files 长度生成文件名，
-        #    这里长度是 0，所以是 sst_0000.txt（干净的世界）
-        path = self._next_sst_path()
-
-        # 这里让 write_from_memtable 自己处理排序逻辑；
-        new_sst = SSTFile.write_from_memtable(path=path,memtable=merged)
-
-        self.sst_files.append(new_sst)
-
-        # 5. 做一次 WAL checkpoint：此时所有状态都在 SST 里了，
-        #    安全地丢弃旧 WAL，把它重置为空。
-        if self.wal is not None:
-            # 先关闭当前 WAL 文件句柄
-            self.wal.close()
-
-            # 直接 truncate：用 "w" 模式重建一个空 wal.log
-            open(self.wal.path,"w").close()
-            # 重新打开 WAL，让后续 put/delete 能继续正常写日志
-            self.wal = WAL(self.wal.path)
-            self.wal.open()
+        compaction.compact_all(self, TOMBSTONE)
