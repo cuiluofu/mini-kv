@@ -1,76 +1,151 @@
-# Mini-KV 设计说明（强化版）
+# MiniKV: A Small LSM-Style Key–Value Store (Built for Learning Systems)
 
-本项目旨在构建一个简化但结构完整的 KV 存储引擎，用于展示 LSM-Tree 在写密集场景下的核心设计思想与系统级 trade-off。整个系统采用典型的写路径：**先写 WAL，再更新 MemTable，最终 flush 成不可变的有序 SST 文件**。
- 此外，本项目将重点研究不同 WAL fsync 策略对吞吐、延迟与可靠性的影响。
+MiniKV is a minimal key–value store I built while learning how storage engines such as LevelDB or RocksDB work internally. 
+The goal is not to create a production database, but to understand and re-implement the core mechanisms of LSM-tree systems:
 
-## 1. 写入路径（Write Path）
+- Write-Ahead Logging (WAL)
+- MemTable → SST flushing
+- Tombstone-based deletion
+- Full compaction and snapshots
+- Durability policies based on fsync frequency
 
-当用户调用 `put(k, v)` 时，系统执行如下步骤：
+The entire codebase is intentionally kept small so that each component is easy to explain and reason about.
 
-### （1）Append-only 写入 WAL
 
-- 将操作以追加记录的方式写入 WAL，以获得顺序写带来的低延迟。
-- WAL 是整个系统的持久化来源，用于在 crash 时恢复最新 MemTable 状态。
-- 写 WAL 是写入路径的“可靠性屏障”——记录一旦落盘，则最终可以恢复。
+## 1. Why I Built This
 
-### （2）更新 MemTable
+I wanted to understand the internals of modern LSM-tree storage engines through a hands-on implementation, rather than only reading papers or documentation. Building MiniKV helped me explore several core questions:
 
-- 在 WAL 写入成功后，更新内存中的 MemTable。
-- MemTable 保存最新的数据，是所有读取请求的首选查询位置。
+- how a write-ahead log ensures durability and supports crash recovery,
+- how data flows from MemTable to immutable SST files,
+- how tombstones and versioning are handled in practice,
+- how compaction cleans up stale data and rebuilds a consistent snapshot,
+- how different fsync policies affect write throughput.
 
-上述流程确保了 LSM 的关键不变量：
+MiniKV is my way of learning these mechanisms by implementing them end-to-end in a small, explainable system.
 
-> **已写入 WAL 的操作最终一定可恢复。**
 
-## 2. Flush 与 SST 文件（SST Files）
 
-当 MemTable 达到容量阈值时，其内容会被排序并写入磁盘，生成一个不可变的 SST 文件。
+## 2. Architecture Overview (High-Level)
 
-SST 文件具有以下特性：
+MiniKV follows a simplified LSM-tree workflow:
 
-1. 内部按 key 排序，可进行二分查找。
-2. 文件不可修改，只能追加生成，从而避免随机写。
-3. 多个 SST 文件按时间顺序堆叠形成“层级结构”。
+```text
+put / delete
+    ↓
+  WAL (append-only)
+    ↓
+  MemTable (in memory)
+    ↓
+  SST files (sorted, immutable)
+    ↓
+  Compaction (merge + clean up + snapshot)
+```
 
-此设计使系统获得高写入吞吐，但需要依赖 compaction 控制文件数量和读放大。
+Reads consult:
 
-## 3. Compaction 策略（Key-Range Merge）
+1. MemTable  
+2. SST files (from newest to oldest)
 
-Compaction 是 LSM 树的核心操作，用于控制读放大与磁盘占用。本项目采用一个简化的两层 compaction 策略：
+This matches the “latest write wins” semantics commonly used in real LSM-tree systems.
 
-1. 最新的 SST（Level-0）与旧 SST 之间按 key 范围进行合并。
-2. 去除删除标记（tombstones）与旧版本的 key。
-3. 生成 key 范围不重叠的新 SST 文件，保持读取路径的高效性。
 
-该策略保持 LSM 基本结构，同时避免实现复杂的多层 compaction 算法。
+## 3. Main Components
 
-## 4. 三种 WAL fsync 策略（研究部分）
+### WAL (Write-Ahead Log)
+- Append-only text log (`wal.log`)
+- Each write is recorded before being applied to MemTable
+- Replayed on startup to restore state after a crash
 
-为了研究 reliability–latency–throughput 之间的系统级 trade-off，本项目实现三种 WAL 持久化策略：
+### MemTable & SST Files
+- MemTable is an in-memory dictionary
+- When full, it is flushed into a new SST file
+- SST files are immutable and sorted, stored as `key\tvalue` lines
 
-### **（1）Sync Every Write（强一致落盘）**
+### Tombstone-Based Deletion
+- Delete operations write a tombstone marker
+- Tombstones override older SST values
+- Compaction removes tombstones physically
 
-- 每个 `put()` 后立即执行 fsync。
-- 保证可靠性最高（最多丢 0 条）。
-- 延迟最高，吞吐最低。
+### Full Compaction
+- Merges all SST files from newest to oldest
+- Keeps only the latest version of each key
+- Drops keys whose latest value is a tombstone
+- Produces one compacted SST and truncates WAL (checkpoint)
 
-### **（2）Fixed Batch Write（固定批量写）**
+### WAL Durability Policies
+- **SYNC** – fsync after every operation  
+- **BATCH** – fsync every *N* operations or after a time interval  
+- **ADAPTIVE** – adjusts batch size according to recent write throughput  
 
-- 累积 N 条 WAL 记录后再 fsync。
-- 延迟显著降低，吞吐提高。
-- crash 时最多丢失 N 条记录。
 
-### **（3）Adaptive Batch Write（自适应批量写，创新点）**
+## 4. Performance Summary
 
-根据实时负载调整批量大小：
+Benchmark: 500K writes on a consumer SSD.
 
-- 高写入负载 → 扩大批量，提高吞吐
-- 低写入负载 → 缩小批量，提高可靠性
-- 目标是得到比固定批量更好的“吞吐—可靠性折中”
+| Mode     | QPS       | fsyncs  |
+|----------|-----------|---------|
+| SYNC     | 2.3 K     | 500,001 |
+| BATCH    | 189 K     | 5,003   |
+| ADAPTIVE | 402 K     | 1,253   |
 
-本项目将评估三种策略在以下指标上的表现：
+The ADAPTIVE policy achieves roughly 170× higher throughput than SYNC while also reducing the number of `fsync` calls from 500K to about 1.2K.
 
-- 写吞吐（QPS）
-- P99 写延迟
-- fsync 次数
-- crash 场景下的最大数据丢失量
+## 5. Repository Structure
+
+```text
+minikv/
+  engine.py         # main KV engine
+  wal.py            # WAL format + replay
+  sst.py            # SST read/write logic
+  compaction.py     # full compaction implementation
+  config.py         # engine config + WAL policies
+
+bench_write.py      # benchmark for write durability modes
+
+tests/
+  test_wal.py
+  test_sst.py
+  test_engine.py
+  test_restart_delete.py
+
+README.md
+```
+
+## 6. Getting Started
+
+### Requirements
+- Python 3.10+
+- No external dependencies; everything uses the standard library.
+
+### Running Tests
+
+```bash
+# 从项目根目录运行：
+python -m tests.test_wal
+python -m tests.test_sst
+python -m tests.test_engine
+python -m tests.test_restart_delete
+```
+### Running the Benchmark
+
+```bash
+python -m tests.bench_write
+```
+This benchmark compares SYNC, BATCH, and ADAPTIVE WAL durability policies.
+
+## 7. Future Work
+
+MiniKV is intentionally minimal and single-threaded.  
+Possible future extensions include:
+
+- Leveled or tiered compaction strategies  
+- Background compaction thread  
+- Sparse indexes / block-based SST layout  
+- Bloom filters to reduce disk lookups  
+- Concurrent readers with finer-grained locking  
+- More realistic workloads (p95/p99 latency)
+
+---
+
+This project helped me understand durability, crash recovery, IO paths, compaction, and performance trade-offs — the core ideas behind modern LSM-tree storage engines.
