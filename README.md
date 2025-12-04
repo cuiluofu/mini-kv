@@ -101,13 +101,14 @@ minikv/
   compaction.py     # full compaction implementation
   config.py         # engine config + WAL policies
 
-bench_write.py      # benchmark for write durability modes
 
 tests/
+  basic_test.py
   test_wal.py
   test_sst.py
   test_engine.py
   test_restart_delete.py
+  bench_write.py      # benchmark for write durability modes
 
 README.md
 ```
@@ -121,7 +122,7 @@ README.md
 ### Running Tests
 
 ```bash
-# 从项目根目录运行：
+# Run from the project root directory
 python -m tests.test_wal
 python -m tests.test_sst
 python -m tests.test_engine
