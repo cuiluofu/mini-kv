@@ -36,6 +36,7 @@ def test_wal_replay_basic() -> None:
         wal2.replay_into(memtable)
 
         # Expected: key "a" was deleted; only "b" remains.
+        assert memtable == {"b": "2"}
         print("✅ test_wal_replay_basic passed:", memtable)
 
 
